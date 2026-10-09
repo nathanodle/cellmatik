@@ -1,0 +1,13 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+config.toml
+/media/
+/recordings/
+*.log
+/realsms/
+/src_dir_sync/
+__pycache__/
+*.pyc
+token.txt

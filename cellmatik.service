@@ -1,0 +1,19 @@
+[Unit]
+Description=Cellmatik cellular gateway (SMS/voice/MMS over LAN HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Change to your deploy user; must be in `dialout` and `gpio` groups.
+User=aiml
+ExecStart=/usr/local/bin/cellmatik --config /etc/cellmatik/config.toml
+Restart=always
+RestartSec=5
+# Interface ownership for MMS (link up, addresses, bound sockets, DHCP on
+# UDP 68). No full root: only these three capabilities.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

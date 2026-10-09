@@ -1,0 +1,47 @@
+# Cellmatik example configuration — copy to config.toml and fill in.
+# The live config NEVER enters git (privacy rule, spec §6).
+
+listen = "0.0.0.0:8080"          # LAN only — reverse-proxy + TLS before exposing further
+db_path = "/var/lib/cellmatik/cellmatik.db"
+serial_path = "/dev/serial/by-id/usb-Quectel_Incorporated_RM520N-GL-if00-port0"
+modem_profile = "rm520n"          # "rm520n" | "sim7600"
+queue_limit = 32
+webhook_timeout_s = 5
+heartbeat_s = 20
+default_delivery_report = true
+stale_after_s = 120
+submit_retries = 3
+retry_interval_s = 60
+max_segments = 10                 # 1–255; single segment = 160 septets, else 153 × n
+csmp_vp = 167                     # GSM 03.40 relative validity; 167 = 24 h (the SMSC give-up deadline)
+
+[voice]
+audio_device = "default"          # ALSA name of the USB adapter
+audio_codec = "g711u"
+audio_frame_ms = 20
+audio_grace_s = 5
+ring_timeout_s = 30
+max_call_duration_s = 3600
+dtmf_detection = true
+
+[retention]
+mode = "sweep"                    # "sweep" | "manual" | "none"
+sweep_hour = 3                    # local hour for the nightly job
+inbox_retention_days = 90
+outbox_retention_days = 90
+calls_retention_days = 90
+
+[recovery]
+gpio_power_cycle = true           # HAT PWRKEY hard power-cycle (recovery rung 3)
+pwrkey_gpio = 17                  # GPIO line of the HAT PWRKEY — verify against your HAT
+recovery_backoff_s = 300
+
+[mms]
+enabled = false                   # flip to true only after filling the carrier profile below
+manage_interface = "cellmatik"    # "cellmatik" | "host" — who owns the wwan interface
+apn = "your-carrier-apn"          # carrier data APN (e.g. their broadband/iot APN)
+mmsc_url = "http://mmsc.example-carrier.net/mms"
+proxy = ""                        # optional carrier HTTP proxy (host:port), empty = direct
+ua = "cellmatik/0.1"
+max_bytes = 1000000               # outbound image cap
+mms_delivery_ack = false          # promote sent → delivered on the phone's acknowledgement
