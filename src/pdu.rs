@@ -1033,7 +1033,7 @@ mod tests {
     fn real_att_stored_deliver_decodes() {
         // Stored-ME deliver found at boot (prior session's loopback,
         // 54 octets, numbers anonymized): UDL=30 septets / 27 UD octets.
-        let hex = "0791312155153254040B915155214365F70000620180223443691E4BB7FB1D068BD51F39795D66CDC9F2F9A71C77B33F6CF798CC6E01";
+        let hex = "0791312155153254040B915155214365F70000620180223443691ECCF71B2E0E8FD7A079996D6ED1CB733AC82C7FB741ED37B9DC7601";
         match decode_pdu(hex) {
             Ok(PduKind::Deliver(d)) => {
                 assert_eq!(d.sender, "+15551234567");
