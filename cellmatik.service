@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 # Change to your deploy user; must be in `dialout` and `gpio` groups.
-User=aiml
+User=cellmatik
 ExecStart=/usr/local/bin/cellmatik --config /etc/cellmatik/config.toml
 Restart=always
 RestartSec=5
