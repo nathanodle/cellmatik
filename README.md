@@ -67,6 +67,9 @@ API surface: `/healthz`, `/v1/status`, `/v1/sms` (POST/GET, `GET {id}`),
 answer/hangup/dtmf, `audio` WebSocket), `/v1/mms` (POST/GET, `GET {id}`),
 `/v1/media/{id}` (raw bytes).
 
+**Full reference with request/response shapes, error table, SSE event
+types, and curl examples: [docs/API.md](docs/API.md).**
+
 ## Deterministic end-to-end suite
 
 `e2e_fake.py` (python3, stdlib only) builds a fake modem on a pty and runs
@@ -85,12 +88,15 @@ All checks must pass; it is the regression gate for this repo.
 
 - RM520N-GL: AT port, PDU mode, `CNMI=2,1,0,2,0` (verified by readback),
   `+QCCID` for ICCID, `+QNWINFO` for band.
-- SIM7600G-H: DIP A on, `AT+DPTONE`/`AT+CPCMBANDWIDTH=1,1`, ECM
-  provisioned at swap time.
+- SIM7600G-H: DIP A on, `AT+CPCMBANDWIDTH=1,1` at boot; band via
+  `+CPSI`, ICCID via `+CCID`. (DTMF detection `AT+DDET` is not in every
+  SIM7600 firmware and is not sent.)
 - Status-report routing varies by carrier: some SMSCs never send
-  `+CDS` even with TP-SRR set. Such messages stay `pending`/`submitted`
-  and are failed by the validity sweep (`no_delivery_report`) — see
-  `csmp_vp` and `stale_after_s`.
+  `+CDS` even with TP-SRR set — observed on AT&T with both a RM520N and
+  a SIM7600 (routing verified via `+CNMI` readback, storage verified
+  empty, so it is the carrier, not the gateway). Such messages stay
+  `pending`/`submitted` and are failed by the validity sweep
+  (`no_delivery_report`) — see `csmp_vp` and `stale_after_s`.
 
 ## License
 

@@ -774,7 +774,9 @@ impl Worker {
     /// dead modem); any timeout aborts with false.
     async fn run_init(&mut self) -> bool {
         let profile_cmds: &[&str] = match self.cfg.profile {
-            ModemProfile::Sim7600 => &["AT+DDET=1", "AT+CPCMBANDWIDTH=1,1"],
+            // DDET (inbound DTMF detect) is not in every SIM7600 firmware
+            // (this unit rejects it) — leave it out; outbound DTMF uses VTS.
+            ModemProfile::Sim7600 => &["AT+CPCMBANDWIDTH=1,1"],
             ModemProfile::Rm520n => &[],
         };
         let ladder: Vec<&str> = [
@@ -1204,12 +1206,25 @@ impl Worker {
             }
         }
         if let Ok(lines) = self.wat("ATI", Duration::from_secs(5)).await {
-            let mut it = lines.iter().filter(|l| !l.trim().is_empty());
-            if let Some(m) = it.next() {
-                self.info.model = m.trim().chars().take(64).collect();
+            let trimmed: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            // Prefer labeled lines (SIM7600: `Model: SIMCOM_SIM7600G-H`,
+            // `Revision: SIM7600G_V2.0.2`); fall back to first/last line
+            // (RM520N/fake: bare model name + `Revision: …`).
+            let model = lines
+                .iter()
+                .find_map(|l| l.trim().strip_prefix("Model: "))
+                .map(|m| m.trim().to_string())
+                .or_else(|| trimmed.first().map(|l| l.to_string()));
+            if let Some(m) = model {
+                self.info.model = m.chars().take(64).collect();
             }
-            if let Some(f) = it.last() {
-                self.info.fw = f.trim().trim_start_matches("Revision: ").chars().take(64).collect();
+            let fw = lines
+                .iter()
+                .find_map(|l| l.trim().strip_prefix("Revision: "))
+                .map(|f| f.trim().to_string())
+                .or_else(|| trimmed.last().map(|l| l.to_string()));
+            if let Some(f) = fw {
+                self.info.fw = f.chars().take(64).collect();
             }
         }
         // The modem answered the poll: it is ready (probing/recovering end
@@ -1391,37 +1406,58 @@ fn parse_qnwinfo_band(l: &str) -> Option<String> {
     Some(band.chars().take(8).collect())
 }
 
-/// `+CPSI: LTE,Online,...,Band 3,...` / `5G ... Band n41` → band token.
+/// `+CPSI: LTE,Online,...,EUTRAN-BAND2,...` / `... Band 3 ...` /
+/// `NR5G_BAND:N41` → band token ("B2"/"B3"/"Bn41"), matching the
+/// `+QNWINFO` "B3" style so both profiles display the same format.
+/// Case-insensitive: firmwares emit `EUTRAN-BAND2`, `Band 3`,
+/// `NR5G_BAND:N41`.
 fn parse_cpsi_band(l: &str) -> Option<String> {
     let t = l.strip_prefix("+CPSI:")?.trim();
-    let rest = t.split("Band").nth(1)?;
-    let band: String = rest
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_alphanumeric())
-        .take(8)
-        .collect();
-    if band.is_empty() {
-        None
-    } else {
-        Some(band)
-    }
-}
-
-/// `+CNUM: "","+15551234567",129` → the +E.164 token.
-fn parse_cnum(l: &str) -> Option<String> {
-    let t = l.strip_prefix("+CNUM:")?;
-    for f in t.split(',') {
-        let f = f.trim().trim_matches('"');
-        if f.starts_with('+')
-            && f.len() >= 8
-            && f.len() <= 24
-            && f[1..].bytes().all(|b| b.is_ascii_digit())
-        {
-            return Some(f.to_string());
+    for tok in t.split(',') {
+        let up = tok.trim().to_ascii_uppercase();
+        let rest = up
+            .strip_prefix("EUTRAN-BAND")
+            .or_else(|| up.strip_prefix("NR5G-BAND"))
+            .or_else(|| up.strip_prefix("NR5G_BAND"))
+            .or_else(|| up.strip_prefix("BAND"));
+        let Some(rest) = rest else { continue };
+        let band: String = rest
+            .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect();
+        if !band.is_empty() {
+            return Some(format!("B{band}"));
         }
     }
     None
+}
+
+/// `+CNUM: <alpha>,<number>,<type>` → E.164 MSISDN. Shapes seen on real
+/// hardware: `+CNUM: "","+15551234567",129` (classic E.164),
+/// `+CNUM: ,"15739992523",129` (RM520N — empty alpha, national digits),
+/// `+CNUM: "15739992523","15739992523",129` (SIM7600 — number in both
+/// fields). The first field that is pure digits (optional leading `+`,
+/// 7–15 long) is the number — the alpha name only survives that filter
+/// when it *is* the number. National shapes normalize: 10 digits get
+/// `+1` (NANP), anything else just gains the `+`.
+fn parse_cnum(l: &str) -> Option<String> {
+    let t = l.strip_prefix("+CNUM:")?;
+    let field = t
+        .split(',')
+        .map(|f| f.trim().trim_matches('"'))
+        .find(|f| {
+            let d = f.strip_prefix('+').unwrap_or(f);
+            (7..=15).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit())
+        })?;
+    let d = field.strip_prefix('+').unwrap_or(field);
+    Some(if field.starts_with('+') {
+        format!("+{d}")
+    } else if d.len() == 10 {
+        format!("+1{d}")
+    } else {
+        format!("+{d}")
+    })
 }
 
 #[cfg(test)]
@@ -1575,14 +1611,30 @@ mod tests {
             parse_qnwinfo_band("+QNWINFO: \"FDD\",\"B3\",\"LTE\",1650"),
             Some("B3".into())
         );
+        // Real SIM7600 CPSI line (EUTRAN-BAND2, no space, uppercase)
+        assert_eq!(
+            parse_cpsi_band("+CPSI: LTE,Online,310-410,0x6603,62770442,278,EUTRAN-BAND2,700,3,3,-189,-1186,-828,11"),
+            Some("B2".into())
+        );
         assert_eq!(
             parse_cpsi_band("+CPSI: LTE,Online,460-00,0x14A2,185E,EARFCN 1650, Band 3, DL BW:5M"),
-            Some("3".into())
+            Some("B3".into())
         );
+        assert_eq!(parse_cpsi_band("+CPSI: LTE,Online"), None);
         assert_eq!(
             parse_cnum("+CNUM: \"\",\"+15551234567\",129"),
             Some("+15551234567".into())
         );
+        // Real RM520N shape: empty alpha, national digits, no '+'
+        assert_eq!(parse_cnum("+CNUM: ,\"15739992523\",129"), Some("+15739992523".into()));
+        // Real SIM7600 shape: number in both alpha and number fields
+        assert_eq!(
+            parse_cnum("+CNUM: \"15739992523\",\"15739992523\",129"),
+            Some("+15739992523".into())
+        );
+        // 10-digit NANP gains +1; unprefixed international gains +
+        assert_eq!(parse_cnum("+CNUM: \"\",\"5739992523\",129"), Some("+15739992523".into()));
+        assert_eq!(parse_cnum("+CNUM: \"\",\"447911123456\",145"), Some("+447911123456".into()));
         assert_eq!(parse_cnum("+CNUM: \"\",\"x\",129"), None);
     }
 }

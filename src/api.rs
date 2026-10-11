@@ -542,4 +542,27 @@ mod tests {
         let t = crate::db::ts_plus(60);
         assert!(t.ends_with('Z') && t.len() == 24);
     }
+
+    /// docs/API.md must not reference a route the router does not serve:
+    /// every `### METHOD /path` heading in the doc must appear as a route
+    /// literal in this file. Catches doc drift in the docs→code direction.
+    #[test]
+    fn documented_routes_exist() {
+        const DOC: &str = include_str!("../docs/API.md");
+        const SRC: &str = include_str!("api.rs");
+        let mut found = 0;
+        for line in DOC.lines() {
+            let Some(rest) = line.strip_prefix("### ") else { continue };
+            let path = rest.split_whitespace().nth(1).unwrap_or("");
+            if !path.starts_with('/') {
+                continue; // prose heading, not an endpoint
+            }
+            assert!(
+                SRC.contains(&format!("\"{path}\"")),
+                "docs/API.md documents {path} but api.rs has no such route"
+            );
+            found += 1;
+        }
+        assert!(found >= 15, "expected every endpoint documented, found {found}");
+    }
 }
