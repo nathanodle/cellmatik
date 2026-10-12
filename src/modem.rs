@@ -990,18 +990,33 @@ impl Worker {
     }
 
     async fn handle_cmti(&mut self, index: u32) {
-        match self.wat(&format!("AT+CMGR={index}"), Duration::from_secs(10)).await {
-            Ok(lines) => {
-                if let Some(hex) = lines.iter().map(|l| l.trim()).find(|l| is_hex(l)) {
-                    self.handle_pdu(hex).await;
-                } else {
-                    tracing::warn!(index, "cmgr returned no pdu");
+        // SIMCom firmware can emit +CMTI before the message is fully
+        // committed to storage; retry the read once before concluding.
+        let mut lines: Option<Vec<String>> = None;
+        for attempt in 0..2 {
+            match self.wat(&format!("AT+CMGR={index}"), Duration::from_secs(10)).await {
+                Ok(ls) => {
+                    if ls.iter().map(|l| l.trim()).any(|l| is_hex(l)) {
+                        lines = Some(ls);
+                        break;
+                    }
                 }
-                // delete regardless of decode outcome; a failed decode is
-                // re-imported only if we DIDN'T delete, which would loop
+                Err(_) => {}
+            }
+            if attempt == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        match lines {
+            Some(ls) => {
+                if let Some(hex) = ls.iter().map(|l| l.trim()).find(|l| is_hex(l)) {
+                    self.handle_pdu(hex).await;
+                }
+                // delete only after a successful read; a message we never
+                // managed to read must stay in storage (CMGL-recoverable)
                 let _ = self.wat(&format!("AT+CMGD={index}"), Duration::from_secs(5)).await;
             }
-            Err(e) => tracing::warn!(index, error = %e, "cmgr failed (message left stored)"),
+            None => tracing::warn!(index, "cmgr returned no pdu (left stored)"),
         }
     }
 

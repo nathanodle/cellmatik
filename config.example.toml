@@ -39,6 +39,11 @@ recovery_backoff_s = 300
 [mms]
 enabled = false                   # flip to true only after filling the carrier profile below
 manage_interface = "cellmatik"    # "cellmatik" | "host" — who owns the wwan interface
+                                   # "host": the OS configures the interface (e.g. NetworkManager
+                                   # static profile) and cellmatik only binds fetches to it — the
+                                   # right mode for RNDIS modems (SIM7600 etc.) whose built-in DHCP
+                                   # server is flaky; give the host a static address in the modem's
+                                   # NAT subnet (e.g. 192.168.225.100/24, gw .1, metric above LAN)
 apn = "your-carrier-apn"          # carrier data APN (e.g. their broadband/iot APN)
 mmsc_url = "http://mmsc.example-carrier.net/mms"
 proxy = ""                        # optional carrier HTTP proxy (host:port), empty = direct

@@ -180,8 +180,10 @@ impl Mms {
             .await?
             .ok_or_else(|| anyhow::anyhow!("media row {} missing", row.media.id))?;
         let tx_id = tx_id_gen();
+        // Handset-shape recipient address: <E.164>/TYPE=PLMN
+        let to = format!("{}/TYPE=PLMN", row.to_num);
         let encoded = crate::wbxml::encode_send_req(
-            &row.to_num,
+            &to,
             &tx_id,
             row.text.as_deref(),
             Some((&media_row.name, &media_row.content_type, &data)),
@@ -232,9 +234,10 @@ impl Mms {
                         m.remove(&row.id);
                     }
                     self.db.set_mms_state(row.id, MmsStatus::Sent, None).await?;
-                    tracing::info!(target: "cellmatik::mms", id = row.id, "mms sent");
+                    tracing::info!(target: "cellmatik::mms", id = row.id, mmsc_id = ?conf.message_id, text = ?conf.response_text, "mms sent");
                 }
                 crate::wbxml::MmsResponse::Transient => {
+                    tracing::warn!(target: "cellmatik::mms", id = row.id, status = ?conf.status, byte = %format!("{:#04x}", conf.status_byte), text = ?conf.response_text, "mmsc send-conf transient");
                     let used = self.bump_retry(row.id);
                     if used >= MMS_SEND_RETRIES {
                         self.db
@@ -247,6 +250,7 @@ impl Mms {
                     }
                 }
                 crate::wbxml::MmsResponse::Permanent | crate::wbxml::MmsResponse::Unrecognized(_) => {
+                    tracing::warn!(target: "cellmatik::mms", id = row.id, status = ?conf.status, byte = %format!("{:#04x}", conf.status_byte), text = ?conf.response_text, "mmsc send-conf permanent");
                     if let Ok(mut m) = self.retries.lock() {
                         m.remove(&row.id);
                     }

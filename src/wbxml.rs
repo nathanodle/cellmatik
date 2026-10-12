@@ -76,6 +76,8 @@ const N_SUBJECT: u8 = 0x16;
 const N_MESSAGE_CLASS: u8 = 0x0A;
 const N_PRIORITY: u8 = 0x0F;
 const N_DATE: u8 = 0x05;
+const N_DELIVERY_REPORT: u8 = 0x06;
+const N_READ_REPLY: u8 = 0x10;
 const N_REPORT_ALLOWED: u8 = 0x11;
 
 fn field(n: u8) -> u8 {
@@ -93,6 +95,8 @@ const MT_DELIVERY_IND: u8 = 0x86;
 
 // MMS version 1.3 → short-integer of 0x13.
 const VERSION_13: u8 = 0x93;
+// MMS version 1.0 → short-integer of 0x10 (what handsets send on AT&T).
+const VERSION_10: u8 = 0x92;
 
 // WSP content-type assigned numbers (WAP-230 Table 40, 0-based).
 const MEDIA_TEXT_PLAIN: u8 = 0x03;
@@ -102,12 +106,24 @@ const MEDIA_IMAGE_PNG: u8 = 0x20;
 const MEDIA_MULTIPART_MIXED: u8 = 0x23;
 const MEDIA_MULTIPART_RELATED: u8 = 0x33;
 const MEDIA_MMS_MESSAGE: u8 = 0x3E;
+const MEDIA_APP_SMIL: u8 = 0x09;
 
 // WSP well-known parameter tokens (WAP-230 Table 38, short-int form).
+// Type is 0x09 → 0x89 (verified against a live handset capture; the
+// OMA-MMS-ENC doc lists 0x02, and 0x07 is wrong — neither works on AT&T).
 const P_CHARSET: u8 = 0x81;
+const P_TYPE: u8 = 0x89;
 const P_NAME: u8 = 0x85;
 const P_FILENAME: u8 = 0x86;
 const P_START: u8 = 0x8A;
+
+// Charset short-int (MIBEnum 106 = UTF-8) as used inside
+// Encoded-string-value and Charset parameters.
+const CHARSET_UTF8: u8 = 0xEA;
+
+// WSP part headers (HTTP-header code page, WAP-230 Table 38).
+const H_CONTENT_LOCATION: u8 = 0x8E;
+const H_CONTENT_ID: u8 = 0xC0;
 
 // WSP PDU types.
 const WSP_PUSH: u8 = 0x06;
@@ -121,6 +137,7 @@ fn media_number(ct: &str) -> Option<u8> {
         "image/gif" => MEDIA_IMAGE_GIF,
         "image/jpeg" => MEDIA_IMAGE_JPEG,
         "image/png" => MEDIA_IMAGE_PNG,
+        "application/vnd.wap.smil" => MEDIA_APP_SMIL,
         "application/vnd.wap.multipart.mixed" => MEDIA_MULTIPART_MIXED,
         "application/vnd.wap.multipart.related" => MEDIA_MULTIPART_RELATED,
         "application/vnd.wap.mms-message" => MEDIA_MMS_MESSAGE,
@@ -138,6 +155,7 @@ fn media_name(n: u8) -> Option<&'static str> {
         0x07 => "text/x-vCard",
         0x0B => "multipart/*",
         0x0C => "multipart/mixed",
+        MEDIA_APP_SMIL => "application/vnd.wap.smil",
         0x0D => "multipart/form-data",
         0x0F => "multipart/alternative",
         0x10 => "application/*",
@@ -213,6 +231,12 @@ pub struct MmsPart {
 pub struct SendConf {
     pub tx_id: String,
     pub status: MmsResponse,
+    /// Raw M-Send.conf Status byte (OMA-MMS-ENC §7.2.20) — kept for
+    /// diagnostics; `status` is the classification derived from it.
+    pub status_byte: u8,
+    /// Human-readable status text ("Wrong structure", "Message accepted")
+    /// — carriers put the real reason here.
+    pub response_text: Option<String>,
     pub message_id: Option<String>,
 }
 
@@ -391,6 +415,9 @@ impl<'a> Rd<'a> {
                     P_NAME | P_FILENAME | P_START => {
                         name = Some(sub.text_string()?);
                     }
+                    P_TYPE => {
+                        let _ = sub.text_string()?;
+                    }
                     P_CHARSET => {
                         let _ = sub.integer()?;
                     }
@@ -444,6 +471,7 @@ enum F {
     From(Option<String>),
     MessageId(String),
     ResponseStatus(u8),
+    ResponseText(String),
     Status(u8),
     ContentLocation(String),
     ContentType(CtValue),
@@ -512,10 +540,7 @@ fn walk_fields<'a>(rd: &mut Rd<'a>, stop_at_content_type: bool) -> Result<Vec<F>
             }
             c if c == field(N_MESSAGE_ID) => F::MessageId(rd.text_string()?),
             c if c == field(N_RESPONSE_STATUS) => F::ResponseStatus(rd.u8()?),
-            c if c == field(N_RESPONSE_TEXT) => {
-                let _ = rd.encoded_string()?;
-                continue;
-            }
+            c if c == field(N_RESPONSE_TEXT) => F::ResponseText(rd.encoded_string()?),
             c if c == field(N_STATUS) => F::Status(rd.u8()?),
             c if c == field(N_CONTENT_LOCATION) => F::ContentLocation(rd.text_string()?),
             c if c == field(N_SUBJECT) => {
@@ -687,12 +712,18 @@ pub fn decode_send_conf(bytes: &[u8]) -> Result<SendConf, WbxmlError> {
     let mut conf = SendConf {
         tx_id: String::new(),
         status: MmsResponse::Unrecognized(0),
+        status_byte: 0,
+        response_text: None,
         message_id: None,
     };
     for f in fields.iter().skip(1) {
         match f {
             F::TxId(t) => conf.tx_id = t.clone(),
-            F::ResponseStatus(s) => conf.status = map_response(*s),
+            F::ResponseStatus(s) => {
+                conf.status_byte = *s;
+                conf.status = map_response(*s);
+            }
+            F::ResponseText(t) => conf.response_text = Some(t.clone()),
             F::MessageId(m) => conf.message_id = Some(m.clone()),
             F::MessageSize(_) | F::ContentType(_) => {}
             _ => return Err(WbxmlError::Malformed("field")),
@@ -766,6 +797,15 @@ fn push_value_length(out: &mut Vec<u8>, len: usize) {
     }
 }
 
+/// Long-integer: short-length + minimal big-endian bytes (WAP-230 §8.4.2.3).
+fn push_long_integer(out: &mut Vec<u8>, v: u64) {
+    let b = v.to_be_bytes();
+    let first = b.iter().position(|x| *x != 0).unwrap_or(7);
+    let bytes = &b[first..];
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
 fn push_text_string(out: &mut Vec<u8>, s: &str) -> Result<(), WbxmlError> {
     for b in s.bytes() {
         if b < 0x20 || b == 0x7F {
@@ -829,6 +869,15 @@ pub fn encode_acknowledge(tx_id: &str, from: &str, status: u8) -> Vec<u8> {
 
 /// M-Send.req encode: multipart with optional text part + exactly one
 /// image part (`image` = (name, content_type, bytes)).
+/// Encode an M-Send.req. Wire shape mirrors a captured Samsung handset
+/// submission (the only shape AT&T's relay accepts in practice):
+/// MMS version 1.0, `From` = insert-address-token (the relay stamps the
+/// subscriber identity), `To` = charset-framed (utf-8) Encoded-string,
+/// content-type `multipart/related` with Start="<smil>" then
+/// Type="application/smil", SMIL part first, media parts carrying
+/// Name + Content-ID + Content-Location. Explicit From addresses,
+/// quoted Start values, WSP param token 0x87 for Type and v1.3 headers
+/// all got rejected as "Wrong structure".
 pub fn encode_send_req(
     to: &str,
     tx_id: &str,
@@ -841,53 +890,142 @@ pub fn encode_send_req(
     if to.is_empty() {
         return Err(WbxmlError::Malformed("to"));
     }
-    let mut out = Vec::with_capacity(96);
+    let mut out = Vec::with_capacity(160);
     out.push(field(N_MESSAGE_TYPE));
     out.push(MT_SEND_REQ);
     out.push(field(N_TRANSACTION_ID));
     push_token(&mut out, tx_id, "tx-id")?;
     out.push(0x00);
     out.push(field(N_VERSION));
-    out.push(VERSION_13);
+    out.push(VERSION_10);
+    // From: insert-address-token — value-length 1 + token 0x81. The
+    // MMS relay inserts the subscriber address; phones never send it.
+    out.push(field(N_FROM));
+    out.push(0x01);
+    out.push(0x81);
+    // To: Encoded-string-value with charset (utf-8 short-int 0xEA).
     out.push(field(N_TO));
-    push_text_string(&mut out, to)?;
+    let mut to_val = Vec::with_capacity(to.len() + 4);
+    to_val.push(CHARSET_UTF8);
+    push_text_string(&mut to_val, to)?;
+    push_value_length(&mut out, to_val.len());
+    out.extend_from_slice(&to_val);
     out.push(field(N_MESSAGE_CLASS));
     out.push(0x80); // Personal
+    // Expiry: relative 7 days (value-length + Relative-token + long-int).
+    out.push(field(N_EXPIRY));
+    push_value_length(&mut out, 5);
+    out.push(0x81); // Relative-token
+    push_long_integer(&mut out, 604_800);
     out.push(field(N_PRIORITY));
     out.push(0x81); // Normal
+    out.push(field(N_DELIVERY_REPORT));
+    out.push(0x81); // yes
+    out.push(field(N_READ_REPLY));
+    out.push(0x81); // yes
+    // Content-type: multipart/related; Start="<smil>"; Type="application/smil"
+    // (Start before Type, unquoted; Type param token 0x89, short media name).
+    let mut ctv = Vec::with_capacity(32);
+    ctv.push(0x80 | MEDIA_MULTIPART_RELATED);
+    ctv.push(P_START);
+    ctv.extend_from_slice(b"<smil>\x00");
+    ctv.push(P_TYPE);
+    ctv.extend_from_slice(b"application/smil\x00");
     out.push(field(N_CONTENT_TYPE));
-    out.push(0x80 | MEDIA_MULTIPART_MIXED);
+    push_value_length(&mut out, ctv.len());
+    out.extend_from_slice(&ctv);
 
-    // multipart body
-    let n_parts = text.is_some() as u8 + image.is_some() as u8;
+    // multipart body: SMIL presentation part first, then content parts
+    let img_name = image.map(|(n, _, _)| n).unwrap_or("image");
+    let n_parts = 1 + text.is_some() as u8 + image.is_some() as u8;
     push_uintvar(&mut out, n_parts as u64);
-    if let Some(t) = text {
-        push_uintvar(&mut out, 1); // headers_len: content-type only
-        let data = t.as_bytes();
-        push_uintvar(&mut out, data.len() as u64);
-        out.push(0x80 | MEDIA_TEXT_PLAIN);
-        out.extend_from_slice(data);
-    }
+
+    // part 0: application/smil (extension-media text) + Name "smil.xml",
+    // Content-ID "<smil>" (single leading quote), Content-Location "smil.xml"
+    let smil = smil_doc(text.is_some(), img_name);
+    let mut smil_ct = Vec::with_capacity(32);
+    push_text_string(&mut smil_ct, "application/smil")?;
+    smil_ct.push(P_NAME);
+    smil_ct.extend_from_slice(b"smil.xml\x00");
+    let mut sh = Vec::with_capacity(48);
+    push_value_length(&mut sh, smil_ct.len());
+    sh.extend_from_slice(&smil_ct);
+    sh.push(H_CONTENT_ID);
+    sh.extend_from_slice(b"\x22<smil>\x00");
+    sh.push(H_CONTENT_LOCATION);
+    sh.extend_from_slice(b"smil.xml\x00");
+    push_uintvar(&mut out, sh.len() as u64);
+    push_uintvar(&mut out, smil.len() as u64);
+    out.extend_from_slice(&sh);
+    out.extend_from_slice(smil.as_bytes());
+
     if let Some((name, ct, data)) = image {
-        // part content-type: general form with Name parameter
-        let mut hdr = Vec::with_capacity(24);
-        let mut ctv = Vec::with_capacity(16);
-        match media_number(ct) {
-            Some(n) => ctv.push(0x80 | n),
-            None => push_text_string(&mut ctv, ct)?, // extension-media
-        }
-        let param_len = 1 + name.len() + 1; // token + name + NUL
-        push_value_length(&mut hdr, ctv.len() + param_len);
-        hdr.extend_from_slice(&ctv);
-        hdr.push(P_NAME);
-        push_token(&mut hdr, name, "name")?;
-        hdr.push(0x00);
+        let hdr = media_part_headers(name, ct)?;
         push_uintvar(&mut out, hdr.len() as u64);
         push_uintvar(&mut out, data.len() as u64);
         out.extend_from_slice(&hdr);
         out.extend_from_slice(data);
     }
+    if let Some(t) = text {
+        let data = t.as_bytes();
+        let mut th = Vec::with_capacity(48);
+        let mut txt_ct = Vec::with_capacity(32);
+        txt_ct.push(0x80 | MEDIA_TEXT_PLAIN);
+        txt_ct.push(P_NAME);
+        txt_ct.extend_from_slice(b"text.txt\x00");
+        txt_ct.push(P_CHARSET);
+        txt_ct.push(CHARSET_UTF8);
+        push_value_length(&mut th, txt_ct.len());
+        th.extend_from_slice(&txt_ct);
+        th.push(H_CONTENT_ID);
+        th.extend_from_slice(b"\x22<text.txt>\x00");
+        th.push(H_CONTENT_LOCATION);
+        th.extend_from_slice(b"text.txt\x00");
+        push_uintvar(&mut out, th.len() as u64);
+        push_uintvar(&mut out, data.len() as u64);
+        out.extend_from_slice(&th);
+        out.extend_from_slice(data);
+    }
     Ok(out)
+}
+
+/// Media part headers: general-form content-type (constrained media code
+/// or extension-media text) + Name param, then Content-ID "<name>" and
+/// Content-Location name — mirroring the capture.
+fn media_part_headers(name: &str, ct: &str) -> Result<Vec<u8>, WbxmlError> {
+    let mut hdr = Vec::with_capacity(48);
+    let mut ctv = Vec::with_capacity(24);
+    match media_number(ct) {
+        Some(n) => ctv.push(0x80 | n),
+        None => push_text_string(&mut ctv, ct)?, // extension-media
+    }
+    ctv.push(P_NAME);
+    push_token(&mut ctv, name, "name")?;
+    ctv.push(0x00);
+    push_value_length(&mut hdr, ctv.len());
+    hdr.extend_from_slice(&ctv);
+    hdr.push(H_CONTENT_ID);
+    hdr.push(0x22);
+    push_token(&mut hdr, name, "name")?;
+    hdr.push(0x00);
+    hdr.push(H_CONTENT_LOCATION);
+    push_token(&mut hdr, name, "name")?;
+    hdr.push(0x00);
+    Ok(hdr)
+}
+
+/// Minimal SMIL presentation referencing the media parts by their
+/// Content-Location names (the wire contract: `src` matches
+/// Content-Location, `Start`/Content-ID identify this part).
+fn smil_doc(with_text: bool, img_src: &str) -> String {
+    let text_ref = if with_text {
+        "<text src=\"text.txt\" region=\"Text\"/>"
+    } else {
+        ""
+    };
+    format!(
+        "<smil><head><layout><root-layout/><region id=\"Text\" top=\"0\" left=\"0\" height=\"50%\" width=\"100%\"/><region id=\"Image\" top=\"50%\" left=\"0\" height=\"50%\" width=\"100%\"/></layout></head><body><par dur=\"5s\">{text_ref}<img src=\"{img_src}\" region=\"Image\"/></par></body></smil>"
+    )
 }
 
 #[cfg(test)]
@@ -984,13 +1122,14 @@ mod tests {
         let c = decode_send_conf(&ok).unwrap();
         assert_eq!(c.tx_id, "C");
         assert_eq!(c.status, MmsResponse::Ok);
+        assert_eq!(c.status_byte, 0x80);
         assert_eq!(c.message_id.as_deref(), Some("msg"));
         // status classes
         let mk = |s: u8| -> Vec<u8> {
             vec![0x8C, 0x81, 0x98, b'C', 0x00, 0x8D, 0x93, 0x92, s]
         };
         assert_eq!(decode_send_conf(&mk(0xE0)).unwrap().status, MmsResponse::Transient);
-        assert_eq!(decode_send_conf(&mk(0xE1)).unwrap().status, MmsResponse::Transient);
+        assert_eq!(decode_send_conf(&mk(0xE1)).unwrap().status_byte, 0xE1);
         assert_eq!(decode_send_conf(&mk(0xC0)).unwrap().status, MmsResponse::Permanent);
         assert_eq!(decode_send_conf(&mk(0xC5)).unwrap().status, MmsResponse::Permanent);
         assert_eq!(decode_send_conf(&mk(0x81)).unwrap().status, MmsResponse::Transient);
@@ -1001,6 +1140,28 @@ mod tests {
             decode_send_conf(&mk(0x99)).unwrap().status,
             MmsResponse::Unrecognized(0x99)
         );
+        // Real AT&T reject shape: Response-Text carries the reason
+        // ("Wrong structure") — must decode, not error.
+        let att: Vec<u8> = [
+            0x8C, 0x81, 0x98, b'P', b'1', 0x00, 0x8D, 0x93, 0x92, 0xE2, 0x93, b'W', b'r', b'o',
+            b'n', b'g', b' ', b's', b't', b'r', b'u', b'c', b't', b'u', b'r', b'e', 0x00,
+        ]
+        .to_vec();
+        let c = decode_send_conf(&att).unwrap();
+        assert_eq!(c.status, MmsResponse::Transient);
+        assert_eq!(c.status_byte, 0xE2);
+        assert_eq!(c.response_text.as_deref(), Some("Wrong structure"));
+        // Real AT&T accept shape: Ok + text + message-id.
+        let att_ok: Vec<u8> = [
+            0x8C, 0x81, 0x98, b'M', b'1', 0x00, 0x8D, 0x93, 0x92, 0x80, 0x93, b'M', b'e', b's',
+            b's', b'a', b'g', b'e', b' ', b'a', b'c', b'c', b'e', b'p', b't', b'e', b'd', 0x00,
+            0x8B, b'1', b'2', b'3', 0x00,
+        ]
+        .to_vec();
+        let c = decode_send_conf(&att_ok).unwrap();
+        assert_eq!(c.status, MmsResponse::Ok);
+        assert_eq!(c.response_text.as_deref(), Some("Message accepted"));
+        assert_eq!(c.message_id.as_deref(), Some("123"));
     }
 
     // ---- golden: encoders ----
@@ -1024,43 +1185,164 @@ mod tests {
         assert_eq!(out, expect);
     }
 
+    /// Independent uintvar reader for test-side multipart walks.
+    fn read_uv(b: &[u8]) -> (usize, &[u8]) {
+        let mut v = (b[0] & 0x7F) as usize;
+        let mut i = 0;
+        while b[i] & 0x80 != 0 {
+            i += 1;
+            v = (v << 7) | (b[i] & 0x7F) as usize;
+        }
+        (v, &b[i + 1..])
+    }
+
+    /// Walk a WSP multipart body independently of the encoder: returns
+    /// (headers, data) per part and asserts exact consumption.
+    fn walk_parts(b: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (n, mut b) = read_uv(b);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (hl, rest) = read_uv(b);
+            b = rest;
+            let (ul, rest) = read_uv(b);
+            b = rest;
+            let h = b[..hl].to_vec();
+            b = &b[hl..];
+            let d = b[..ul].to_vec();
+            b = &b[ul..];
+            out.push((h, d));
+        }
+        assert!(b.is_empty(), "multipart bytes left over");
+        out
+    }
+
     #[test]
     fn encode_send_req_golden() {
+        let img = [0xFFu8, 0xD8, 0xFF, 0xD9];
         let out = encode_send_req(
-            "+15551234567",
+            "+15551234567/TYPE=PLMN",
             "T1",
             Some("hi"),
-            Some(("a.jpg", "image/jpeg", &[0xFF, 0xD8, 0xFF, 0xD9])),
+            Some(("a.jpg", "image/jpeg", &img)),
         )
         .unwrap();
-        let mut expect: Vec<u8> = vec![
+        // Header prefix byte-pinned: these framing constants are the
+        // shape AT&T's relay accepts (see encode_send_req doc).
+        let mut prefix: Vec<u8> = vec![
             0x8C, 0x80, // m-send-req
             0x98, b'T', b'1', 0x00, // tx
-            0x8D, 0x93, // v1.3
-            0x97, // To
+            0x8D, 0x92, // v1.0
+            0x89, 0x01, 0x81, // From: insert-address-token
+            0x97, // To (Encoded-string, charset-framed)
+            24, // value-length: 0xEA + 22-char address + NUL
+            0xEA, // utf-8
         ];
-        expect.extend_from_slice(b"+15551234567\x00");
-        expect.extend_from_slice(&[0x8A, 0x80, 0x8F, 0x81, 0x84, 0xA3]); // class, priority, ct
-        expect.extend_from_slice(&[0x02]); // count
-        expect.extend_from_slice(&[0x01, 0x02, 0x83, b'h', b'i']); // text part
-        expect.extend_from_slice(&[0x09, 0x04, 0x08, 0x9E, 0x85, b'a', b'.', b'j', b'p', b'g', 0x00, 0xFF, 0xD8, 0xFF, 0xD9]); // image part
-        assert_eq!(out, expect);
+        prefix.extend_from_slice(b"+15551234567/TYPE=PLMN\x00");
+        prefix.extend_from_slice(&[
+            0x8A, 0x80, // class: Personal
+            0x88, 0x05, 0x81, 0x03, 0x09, 0x3A, 0x80, // expiry: 7d relative
+            0x8F, 0x81, // priority: Normal
+            0x86, 0x81, // delivery-report: yes
+            0x90, 0x81, // read-reply: yes
+            0x84, 0x1B, // content-type: value-length 27
+            0xB3, // multipart/related
+            0x8A, // Start param (before Type!)
+        ]);
+        prefix.extend_from_slice(b"<smil>\x00"); // unquoted start value
+        prefix.push(0x89); // Type param (token 0x89)
+        prefix.extend_from_slice(b"application/smil\x00");
+        if !out.starts_with(&prefix) {
+            for (i, (a, b)) in out.iter().zip(&prefix).enumerate() {
+                if a != b {
+                    panic!("golden prefix byte {i}: out={a:#04x} expect={b:#04x}");
+                }
+            }
+            panic!("golden prefix length: out={} prefix={}", out.len(), prefix.len());
+        }
+        // multipart: independent walk, 3 parts (smil, image, text)
+        let parts = walk_parts(&out[prefix.len()..]);
+        assert_eq!(parts.len(), 3);
+        // part 0: application/smil (extension-media) + Name + CID + Content-Location
+        let mut smil_hdr: Vec<u8> = vec![0x1B]; // ct value-length 27
+        smil_hdr.extend_from_slice(b"application/smil\x00");
+        smil_hdr.push(0x85); // Name param
+        smil_hdr.extend_from_slice(b"smil.xml\x00");
+        smil_hdr.push(0xC0); // Content-ID
+        smil_hdr.push(0x22); // single leading quote
+        smil_hdr.extend_from_slice(b"<smil>\x00");
+        smil_hdr.push(0x8E); // Content-Location
+        smil_hdr.extend_from_slice(b"smil.xml\x00");
+        assert_eq!(parts[0].0, smil_hdr);
+        let smil = String::from_utf8(parts[0].1.clone()).unwrap();
+        assert!(smil.contains("src=\"a.jpg\""), "smil img ref: {smil}");
+        // part 1: image/jpeg + Name + CID + Content-Location
+        let mut img_hdr: Vec<u8> = vec![0x08, 0x9E]; // ct value-length 8, image/jpeg
+        img_hdr.push(0x85);
+        img_hdr.extend_from_slice(b"a.jpg\x00");
+        img_hdr.push(0xC0);
+        img_hdr.push(0x22);
+        img_hdr.extend_from_slice(b"a.jpg\x00");
+        img_hdr.push(0x8E);
+        img_hdr.extend_from_slice(b"a.jpg\x00");
+        assert_eq!(parts[1].0, img_hdr);
+        assert_eq!(parts[1].1, img.to_vec());
+        // part 2: text/plain + Name + charset + CID + Content-Location
+        let mut txt_hdr: Vec<u8> = vec![0x0D, 0x83]; // ct value-length 13, text/plain
+        txt_hdr.push(0x85);
+        txt_hdr.extend_from_slice(b"text.txt\x00");
+        txt_hdr.push(0x81); // Charset param
+        txt_hdr.push(0xEA); // utf-8
+        txt_hdr.push(0xC0);
+        txt_hdr.push(0x22);
+        txt_hdr.extend_from_slice(b"<text.txt>\x00");
+        txt_hdr.push(0x8E);
+        txt_hdr.extend_from_slice(b"text.txt\x00");
+        assert_eq!(parts[2].0, txt_hdr);
+        assert_eq!(parts[2].1, b"hi".to_vec());
+    }
+
+    #[test]
+    fn encode_send_req_image_only_two_parts() {
+        let img = [0x00u8, 0x01, 0x02];
+        let out = encode_send_req("+15551234567/TYPE=PLMN", "I1", None, Some(("x", "image/jpeg", &img))).unwrap();
+        let i = out.iter().position(|b| *b == field(N_CONTENT_TYPE)).unwrap();
+        // find multipart start: after ct value-length + value
+        let parts = walk_parts(&out[i + 2 + out[i + 1] as usize..]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].1, img.to_vec());
     }
 
     // ---- roundtrips ----
 
+    /// Locate the multipart body: after the content-type field (0x84),
+    /// skipping its value-length (short or 0x1F-extended) and value.
+    fn body_of(enc: &[u8]) -> &[u8] {
+        let i = enc
+            .iter()
+            .position(|b| *b == field(N_CONTENT_TYPE))
+            .expect("content-type field")
+            + 1;
+        let len = enc[i];
+        if len == 0x1F {
+            // 0x1F + uintvar + value
+            let mut j = i + 1;
+            let mut v: usize = (enc[j] & 0x7F) as usize;
+            while enc[j] & 0x80 != 0 {
+                j += 1;
+                v = (v << 7) | (enc[j] & 0x7F) as usize;
+            }
+            &enc[j + 1 + v..]
+        } else {
+            &enc[i + 1 + len as usize..]
+        }
+    }
+
     #[test]
     fn send_req_roundtrips_through_retrieve_conf() {
         let img: Vec<u8> = (0..64u8).collect();
-        let out = encode_send_req("+15551234567", "TX9", Some("héllo {}"), Some(("pic.png", "image/png", &img))).unwrap();
-        // multipart body = everything after the content-type field value
-        let body_idx = out
-            .windows(2)
-            .position(|w| w == [0x84, 0xA3])
-            .expect("content-type field")
-            + 2;
-        let body = &out[body_idx..];
-        // wrap as m-retrieve-conf
+        let out = encode_send_req("+15551234567/TYPE=PLMN", "TX9", Some("héllo {}"), Some(("pic.png", "image/png", &img))).unwrap();
+        let body = body_of(&out).to_vec();
+        // wrap as m-retrieve.conf
         let mut r: Vec<u8> = vec![0x8C, 0x84, 0x98, b'T', b'X', b'9', 0x00, 0x8D, 0x93];
         let mut from = Vec::new();
         from.push(0x80);
@@ -1069,50 +1351,54 @@ mod tests {
         r.push(from.len() as u8);
         r.extend_from_slice(&from);
         r.extend_from_slice(&[0x84, 0xA3]);
-        r.extend_from_slice(body);
+        r.extend_from_slice(&body);
         let conf = decode_retrieve_conf(&r).unwrap();
         assert_eq!(conf.tx_id, "TX9");
         assert_eq!(conf.from.as_deref(), Some("+15551234567"));
         assert_eq!(conf.text.as_deref(), Some("héllo {}"));
-        assert_eq!(conf.parts.len(), 2);
-        assert_eq!(conf.parts[0].content_type, "text/plain");
+        assert_eq!(conf.parts.len(), 3);
+        assert_eq!(conf.parts[0].content_type, "application/smil");
         assert_eq!(conf.parts[1].content_type, "image/png");
         assert_eq!(conf.parts[1].name.as_deref(), Some("pic.png"));
         assert_eq!(conf.parts[1].data, img);
+        assert_eq!(conf.parts[2].content_type, "text/plain");
+        // SMIL must reference the image part's Content-Location name
+        let smil = String::from_utf8(conf.parts[0].data.clone()).unwrap();
+        assert!(smil.contains("src=\"pic.png\""), "smil missing img ref: {smil}");
     }
 
     #[test]
     fn image_only_and_text_only_roundtrip() {
         let img = [0x00u8, 0x01, 0x02];
-        let out = encode_send_req("+15551234567", "I1", None, Some(("x", "image/jpeg", &img))).unwrap();
+        let out = encode_send_req("+15551234567/TYPE=PLMN", "I1", None, Some(("x", "image/jpeg", &img))).unwrap();
         assert_eq!(out[0], 0x8C);
-        let text = encode_send_req("+15551234567", "T2", Some("words"), None).unwrap();
+        let text = encode_send_req("+15551234567/TYPE=PLMN", "T2", Some("words"), None).unwrap();
         // both decodable as multipart via a retrieve wrapper
-        let body_of = |enc: &[u8]| -> Vec<u8> {
-            let idx = enc.windows(2).position(|w| w == [0x84, 0xA3]).unwrap() + 2;
+        let wrap = |body: &[u8]| -> Vec<u8> {
             let mut r: Vec<u8> = vec![0x8C, 0x84, 0x98, b'R', 0x00, 0x8D, 0x93, 0x84, 0xA3];
-            r.extend_from_slice(&enc[idx..]);
+            r.extend_from_slice(body);
             r
         };
-        let c1 = decode_retrieve_conf(&body_of(&out)).unwrap();
-        assert_eq!(c1.parts.len(), 1);
+        let c1 = decode_retrieve_conf(&wrap(body_of(&out))).unwrap();
+        assert_eq!(c1.parts.len(), 2);
         assert!(c1.text.is_none());
-        assert_eq!(c1.parts[0].data, img.to_vec());
-        let c2 = decode_retrieve_conf(&body_of(&text)).unwrap();
+        assert_eq!(c1.parts[0].content_type, "application/smil");
+        assert_eq!(c1.parts[1].data, img.to_vec());
+        let c2 = decode_retrieve_conf(&wrap(body_of(&text))).unwrap();
         assert_eq!(c2.text.as_deref(), Some("words"));
-        assert_eq!(c2.parts.len(), 1);
+        assert_eq!(c2.parts.len(), 2);
     }
 
     #[test]
     fn extension_media_content_type_roundtrip() {
         // unknown content type string → extension-media → decoded back
-        let out = encode_send_req("+15551234567", "E1", None, Some(("w", "image/webp", &[1, 2]))).unwrap();
-        let idx = out.windows(2).position(|w| w == [0x84, 0xA3]).unwrap() + 2;
+        let out = encode_send_req("+15551234567/TYPE=PLMN", "E1", None, Some(("w", "image/webp", &[1, 2]))).unwrap();
         let mut r: Vec<u8> = vec![0x8C, 0x84, 0x98, b'R', 0x00, 0x8D, 0x93, 0x84, 0xA3];
-        r.extend_from_slice(&out[idx..]);
+        r.extend_from_slice(body_of(&out));
         let conf = decode_retrieve_conf(&r).unwrap();
-        assert_eq!(conf.parts[0].content_type, "image/webp");
-        assert_eq!(conf.parts[0].name.as_deref(), Some("w"));
+        assert_eq!(conf.parts[0].content_type, "application/smil");
+        assert_eq!(conf.parts[1].content_type, "image/webp");
+        assert_eq!(conf.parts[1].name.as_deref(), Some("w"));
     }
 
     #[test]

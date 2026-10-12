@@ -71,12 +71,14 @@ another client's sends. The inbox, calls list, and media are shared.
 **Outbox status model** — stored status is only `pending`, `delivered`, or
 `failed`. While pending, a derived `detail` field says where the message
 is: `queued` (not yet handed to the modem), `retrying` (transient failure,
-will resubmit), or `submitted` (modem accepted it, TP-MR assigned,
-awaiting delivery confirmation). `check_after_s` is the earliest the
-status could plausibly change — poll after that. On `failed`, `error`
-holds the reason (`no_delivery_report` when the validity period expired
-without a `+CDS`, `submit_timeout`, `expired`, or a numeric `+CMS ERROR`
-code) and `retryable` says whether a re-send can succeed.
+will resubmit), `submitted` (modem accepted it, TP-MR assigned, awaiting
+delivery confirmation), or `stale` (submitted but past `stale_after_s`
+— 120 s by default — without a `+CDS`; still live until the validity
+period expires). `check_after_s` is the earliest the status could
+plausibly change — poll after that. On `failed`, `error` holds the reason
+(`no_delivery_report` when the validity period expired without a `+CDS`,
+`submit_timeout`, `expired`, or a numeric `+CMS ERROR` code) and
+`retryable` says whether a re-send can succeed.
 
 ---
 
